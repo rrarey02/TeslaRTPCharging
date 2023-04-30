@@ -31,14 +31,16 @@ import com.rrarey.web.RESTRequest;
 import com.rrarey.web.WebRequest;
 
 public class RTPCharging {
+	static final String programVersion = "1.0.3";
+	
 	// Tesla API base URL
 	static final String apiBase = "https://owner-api.teslamotors.com";
-	
+
 	static final String propertiesFile = "app.properties";
-	
+
 	// Property file keys
 	static final String
-		ACCESS_TOKEN = "ACCESS_TOKEN",	
+		ACCESS_TOKEN = "ACCESS_TOKEN",
 		HOME_LATITUDE = "HOME_LATITUDE",
 		HOME_LONGITUDE = "HOME_LONGITUDE",
 		MAX_ELECTRICITY_PRICE = "MAX_ELECTRICITY_PRICE",
@@ -49,28 +51,28 @@ public class RTPCharging {
 		SOC_GAIN_PER_HOUR = "SOC_GAIN_PER_HOUR",
 		VIN = "VIN"
 	;
-	
+
 	// API call retry settings
-	static final int 
+	static final int
 		MAX_RETRIES = 5,
 		RETRY_INTERVAL_SECONDS = 15
 	;
-	
+
 	// Set in properties file or command line argument
 	static double
 		homeLatitude,
-		homeLongitude,	
+		homeLongitude,
 		maxElectricityPrice,
 		soCGainPerHour
 	;
 	static String
-		accessToken,	
+		accessToken,
 		id,
 		refreshToken,
 		vin
 	;
 	static int
-		minimumDepartureSoC,	
+		minimumDepartureSoC,
 		pollIntervalSeconds
 	;
 	static boolean
@@ -80,25 +82,28 @@ public class RTPCharging {
 	static long
 		lastConfigurationModification = 0
 	;
-	
+
 	// Vehicle location history
-	static CircularFifoQueue<VehicleLocation> vehicleLocationHistory = new CircularFifoQueue<VehicleLocation>(250);	
+	static CircularFifoQueue<VehicleLocation> vehicleLocationHistory = new CircularFifoQueue<VehicleLocation>(250);
 	static VehicleLocation lastHome = null;
-	
+
 	// Objects for API calls
-	static RESTRequest teslaAPI = null;	
+	static RESTRequest teslaAPI = null;
 	static WebRequest teslaCommands = null;
-	
+
     static final Logger logger = LogManager.getLogger(RTPCharging.class);
-	
+
 	public static void main(String[] args) {
+		logger.debug("Loading configuration");
 		loadConfiguration();
-		
+
+		logger.debug("Setting up API objects");
 		setupAPIObjects();
-		
+
+		logger.debug("Requesting vehicle match");
 		JSONObject vehicleMatch = getVehicleMatchForVIN();
-		
-		String displayName = null;		
+
+		String displayName = null;
 		if (vehicleMatch == null) {
 			exitWithError("Vehicle not found in API response.");
 		}
@@ -107,25 +112,34 @@ public class RTPCharging {
 		if (vehicleMatch.has("display_name")) {
 			displayName = vehicleMatch.getString("display_name");
 		}
-		
+
 		TimeZone tz = TimeZone.getTimeZone("America/Chicago");
 		DateFormat df = new SimpleDateFormat("MM/dd/yyyy hh:mm:ss a");
 		df.setTimeZone(tz);
 
+		logger.debug("Checking vehicle charging state");
 		boolean isCharging = isVehicleCharging(id);
+
+		// Flag to set when vehicle reports it is fully charged.
 		boolean wasFullyCharged = false;
+
+		// Flag to set when vehicle goes to sleep at home.
+		boolean asleepAtHome = false;
+
 		String previousVehicleState = "unknown";
+
 		long comEdLastUTC = 0;
 		int defaultLocationPollingSeconds = (5 * 60);	// Default to checking location every five minutes
-		
+
 		// Next time we are going to check on the car's location. Seconds since January 1, 1970.
 		long nextLocationCheckSeconds = 0;
-		
-		log("Starting ComEd Real-Time price monitoring for Tesla VIN " + vehicleMatch.getString("vin") + " (" + ((displayName != null && displayName.length() > 0) ? displayName : id) + ").");
+
+		log("Starting ComEd Real-Time price monitoring version " + programVersion + " for Tesla VIN " + vehicleMatch.getString("vin") + " (" + ((displayName != null && displayName.length() > 0) ? displayName : id) + ").");
 		log("Polling for new price data every " + pollIntervalSeconds + " seconds.");
 		log("Vehicle will" + (!shouldChargeForDepature ? " not" : "") + " be charged to reach minimum departure SoC" + (minimumDepartureSoC > 0 ? " of " + minimumDepartureSoC + "%" : "") + ".");
 		log("Vehicle is" + (!isCharging ? " not" : "") + " currently charging.");
-		
+		logger.debug("Starting main loop");
+
 		// Main loop
 		while(true) {
 			JSONObject currentData = getLatestComEdPrice();
@@ -134,8 +148,8 @@ public class RTPCharging {
 				continue;
 			}
 
-			String currentVehicleState = getVehicleState(id);			
-			
+			String currentVehicleState = getVehicleState(id);
+
 			// Location polling logic:
 			//	1) Always starts from home
 			//	2) Watches for car to move and records those locations
@@ -164,7 +178,7 @@ public class RTPCharging {
 					VehicleLocation currentLocationInHistory = vehicleLocationHistory.get(i);
 					logger.debug("Location: {}", currentLocationInHistory.toString());
 					if (previousLocationInHistory != null && currentLocationInHistory.distanceFrom(previousLocationInHistory) == 0) {
-						// Only set stopped location the first time we encounter the match, so we can know the time it took to go from 
+						// Only set stopped location the first time we encounter the match, so we can know the time it took to go from
 						// home to the location.
 						if (stoppedAtLocation == null) {
 							stoppedAtLocation = previousLocationInHistory;
@@ -174,44 +188,44 @@ public class RTPCharging {
 					}
 					previousLocationInHistory = currentLocationInHistory;
 				}
-				
+
 				if (stoppedAtLocation != null) {
 					logger.debug("Vehicle seems to have stopped at: {}", stoppedAtLocation.toString());
 				} else {
 					logger.debug("Vehicle is not stopped.");
 				}
-				
+
 				// Vehicle is navigating to home - use that to schedule the next location poll.
 				if (previousLocationInHistory != null && previousLocationInHistory.isGoingHome()) {
 					nextLocationCheckSeconds = (long)Math.floor(previousLocationInHistory.getArrivalTimeSeconds());
 					logger.debug(
-						"Vehicle is navigating to home as of {}, with an expected arrival time of {}. Scheduling next location check for {}.", 
+						"Vehicle is navigating to home as of {}, with an expected arrival time of {}. Scheduling next location check for {}.",
 						df.format(new Date((long)previousLocationInHistory.getTimestampMillis())),
 						df.format(new Date(nextLocationCheckSeconds * 1000)),
 						df.format(new Date(nextLocationCheckSeconds * 1000))
 					);
-					
+
 				// Vehicle is navigating away from home - use that to schedule the next location poll.
 				} else if (previousLocationInHistory != null && previousLocationInHistory.isGoingAwayFromHome()) {
 					nextLocationCheckSeconds = (long)Math.floor(previousLocationInHistory.getArrivalTimeSeconds());
 					logger.debug(
-						"Vehicle is navigating away from home as of {}, with an expected arrival time of {}. Scheduling next location check for {}.", 
+						"Vehicle is navigating away from home as of {}, with an expected arrival time of {}. Scheduling next location check for {}.",
 						df.format(new Date((long)previousLocationInHistory.getTimestampMillis())),
 						df.format(new Date(nextLocationCheckSeconds * 1000)),
 						df.format(new Date(nextLocationCheckSeconds * 1000))
 					);
-					
+
 				// Vehicle is stopped - use travel time from home to this stop to schedule the next location poll.
 				} else if (stoppedAtLocation != null && lastHome != null) {
 					// Next location check will be 75% of the travel time from home to stop, after vehicle was stopped.
 					// Unless it was a short time, in which case we'll keep the default.
 					secondsFromHomeToStop = stoppedAtLocation.getTimestamp() - lastHome.getTimestamp();
-					logger.debug("Vehicle was at home and is now stopped at {}. It took {} seconds to go from home to stop.", stoppedAtLocation, secondsFromHomeToStop);					
+					logger.debug("Vehicle was at home and is now stopped at {}. It took {} seconds to go from home to stop.", stoppedAtLocation, secondsFromHomeToStop);
 					if (((double)secondsFromHomeToStop * .75) < defaultLocationPollingSeconds) {
 						secondsFromHomeToStop = (int)Math.floor((double)defaultLocationPollingSeconds / .75);
 					}
 
-					long newNextLocationCheckSeconds = (long)Math.floor(stoppedAtLocation.getTimestamp() + ((double)secondsFromHomeToStop * .75)); 
+					long newNextLocationCheckSeconds = (long)Math.floor(stoppedAtLocation.getTimestamp() + ((double)secondsFromHomeToStop * .75));
 					if (newNextLocationCheckSeconds >= nextLocationCheckSeconds) {
 						nextLocationCheckSeconds = newNextLocationCheckSeconds;
 					}
@@ -219,21 +233,21 @@ public class RTPCharging {
 					updateLocationIfOnline = true;
 				}
 			}
-			
+
 			// Vehicle was most recently seen at home. Only make additional calls if it's online.
 			// This way you can leave the car sitting at home, not plugged in, and we won't drain the battery.
 			if (previousLocation != null && previousLocation.distanceFrom(homeLatitude, homeLongitude) == 0) {
 				updateLocationIfOnline = true;
-				
+
 			// Vehicle is away from home - reset charged flag so we can determine it again when we get home.
 			} else {
 				wasFullyCharged = false;
 			}
-			
+
 			// Check if vehicle was previously not online, but now it is online.
 			boolean vehicleIsNowOnline = (currentVehicleState.equals("online") && !previousVehicleState.equals("online"));
 
-			// Run location poll when necessary. Either the scheduled poll time says we should run it, 
+			// Run location poll when necessary. Either the scheduled poll time says we should run it,
 			// or the vehicle has recently come back online.
 			if (nextLocationCheckSeconds <= currentTime() || vehicleIsNowOnline) {
 				if (vehicleIsNowOnline) {
@@ -256,7 +270,7 @@ public class RTPCharging {
 					currentLocation = updateVehicleLocationDetails(id);
 					updatedLocation = true;
 				}
-				
+
 				if (secondsFromHomeToStop > 0) {
 					nextLocationCheckSeconds += Math.floor((double)secondsFromHomeToStop * .75);
 				} else {
@@ -271,20 +285,30 @@ public class RTPCharging {
 			} else {
 				currentLocation = previousLocation;
 			}
-			
+
+			// This shouldn't happen, but in case it does...
+			if (currentLocation == null) {
+				currentLocation = updateVehicleLocationDetails(id);
+				
+				if (currentLocation == null) {
+					sleep(RETRY_INTERVAL_SECONDS);
+					continue;
+				}
+			}
+
 			double locationTime = currentLocation.getTimestampMillis();
 			double distanceFromHome = currentLocation.distanceFrom(homeLatitude, homeLongitude);
 
 			if (updatedLocation) {
 				log("Vehicle is " + distanceFromHome + " miles from home as of " + df.format(new Date((long)locationTime)));
 			}
-			
+
 			logger.debug("Next vehicle location check scheduled for: {}", df.format(new Date(nextLocationCheckSeconds * 1000)));
-			
+
 			long comEdCurrentUTC = Long.parseLong(currentData.getString("millisUTC"));
 			double currentPrice = currentData.getDouble("price");
 			boolean newData = false;
-			
+
 			if (comEdCurrentUTC != comEdLastUTC) {
 				Date date = new Date(comEdCurrentUTC);
 				log("ComEd 5-minute price (" + currentPrice + "\u00A2 / kWh) from " + df.format(date) + " is " + (currentPrice <= maxElectricityPrice ? "valid for charging (<= " + maxElectricityPrice : "not valid for charging (> " + maxElectricityPrice) + "\u00A2 / kWh)");
@@ -296,7 +320,7 @@ public class RTPCharging {
 			boolean chargePortOpen = false;		// true when door is open. Else false.
 			boolean stopStartCharge = false;	// Set to true when we determine we need to stop and restart charging to get the rate back up.
 			boolean forceCharging = false;		// Set to true when time and departure SoC dictate.
-			
+
 			int minutesToFullCharge = 0;		// Will be set by charge_state response if possible
 			double currentBatteryLevel = 0;		// Will be set by charge_state response if possible
 			double chargeLimit = 90;			// Will be set by charge_state response if possible
@@ -306,46 +330,55 @@ public class RTPCharging {
 			// 1) We have new data AND:
 			//		a) The current ComEd price is <= our max price AND
 			//			i)  The vehicle is not fully charged AND
-			//			ii) The vehicle is not currently charging, OR restart on current drop is enabled 
+			//			ii) The vehicle is not currently charging, OR restart on current drop is enabled
 			//		OR
 			//		b) The current ComEd price is > our max price AND
-			//			i)  The vehicle is charging			
+			//			i)  The vehicle is charging
 			if (newData && distanceFromHome == 0) {
 				JSONObject chargeStateResponse = null;
-				
+
 				if ((currentPrice <= maxElectricityPrice && (!isCharging || restartOnCurrentDrop)) || (currentPrice > maxElectricityPrice && isCharging)) {
 					log("Current vehicle state: " + currentVehicleState);
-					
+
 					if (wasFullyCharged) {
+						boolean isCurrentlySleeping = currentVehicleState.equals("asleep");
 						logger.debug("Vehicle was fully charged at last check. Trying to let it sleep.");
-						continue;						
-					} else if (!currentVehicleState.equals("online")) {
-						wakeUpVehicle(id);
+						if (asleepAtHome && !isCurrentlySleeping) {
+							logger.debug("Vehicle is awake again. Might need to restart charging.");
+							asleepAtHome = false;
+						} else {
+							asleepAtHome = isCurrentlySleeping;
+							continue;
+						}
 					}
 				}
-			
+
 				try {
+					if (!currentVehicleState.equals("online")) {
+						wakeUpVehicle(id);
+					}
+
 					int tries = 0;
 					while (chargeStateResponse == null && ++tries < MAX_RETRIES) {
 						chargeStateResponse = getVehicleChargeState(id);
 						if (chargeStateResponse == null) {
 							refreshTokens();
-							sleep(RETRY_INTERVAL_SECONDS);		
+							sleep(RETRY_INTERVAL_SECONDS);
 						}
 					}
-					
+
 					if (chargeStateResponse == null) {
-						logger.warn("Did not receive charge state response after multiple attenots.");
+						logger.warn("Did not receive charge state response after multiple attempts.");
 						continue;
 					}
-					
+
 					if (chargeStateResponse.has("charging_state") && chargeStateResponse.has("charge_port_door_open")) {
 						minutesToFullCharge = chargeStateResponse.getInt("minutes_to_full_charge");
 						chargingState = chargeStateResponse.getString("charging_state");
 						chargePortOpen = chargeStateResponse.getBoolean("charge_port_door_open");
 						currentBatteryLevel = chargeStateResponse.getDouble("usable_battery_level");
 						chargeLimit = chargeStateResponse.getDouble("charge_limit_soc");
-	
+
 						// Minutes to full charge is only reported if the vehicle is actually charging.
 						String fullCharge = "";
 						if (minutesToFullCharge > 0) {
@@ -357,17 +390,17 @@ public class RTPCharging {
 								fullCharge = " " + String.format("%02dm", minutes) + " remaining to charge limit.";
 							}
 						}
-						
+
 						int timestamp = (int) Math.floor(chargeStateResponse.getDouble("timestamp") / 1000);
 						int departureTime = chargeStateResponse.getInt("scheduled_departure_time");
 						if (departureTime > timestamp) {
 							minutesToDeparture = (int) Math.floor((departureTime - timestamp) / 60);
 						}
-						
+
 						log("Charge: " + String.valueOf(currentBatteryLevel) + "%. Charge limit: " + String.valueOf(chargeLimit) + "%." + fullCharge);
-						if (minutesToDeparture > 0 && minimumDepartureSoC > 0) {
+						if (minutesToDeparture > 0 && minimumDepartureSoC > 0 && minimumDepartureSoC > currentBatteryLevel) {
 							log(minutesToDeparture + " minutes to departure at " + minimumDepartureSoC + "% charge.");
-							
+
 							double soCGainPerMinute = (soCGainPerHour / 60);
 							double requiredCharge = minimumDepartureSoC - currentBatteryLevel;
 							int minutesToDepartureSoC = (int) Math.ceil(requiredCharge / soCGainPerMinute);
@@ -380,19 +413,19 @@ public class RTPCharging {
 							}
 						}
 					}
-	
+
 					// Charge current we'd like to see
 					double requestedChargeAmps = 12;
 					if (chargeStateResponse.has("charge_current_request") && !chargeStateResponse.isNull("charge_current_request")) {
 						requestedChargeAmps = chargeStateResponse.getDouble("charge_current_request");
 					}
-	
-					// Charge current we are currently seeing				
+
+					// Charge current we are currently seeing
 					double chargerActualCurrent = requestedChargeAmps;
 					if (chargeStateResponse.has("charger_actual_current") && !chargeStateResponse.isNull("charger_actual_current")) {
 						chargerActualCurrent = chargeStateResponse.getDouble("charger_actual_current");
 					}
-					
+
 					if (restartOnCurrentDrop) {
 						if (chargerActualCurrent < requestedChargeAmps) {
 							stopStartCharge = true;
@@ -400,12 +433,12 @@ public class RTPCharging {
 					}
 				} catch (Exception ex) {
 					logger.error("Failed to parse charge state response: {}", ExceptionUtils.getExceptionString(ex));
-				}				
-			
+				}
+
 				if (
-					chargePortOpen && 
-					chargingState != null && 
-					chargingState.length() > 0 && 
+					chargePortOpen &&
+					chargingState != null &&
+					chargingState.length() > 0 &&
 					!chargingState.equals("Disconnected")
 				) {
 					wasFullyCharged = false;
@@ -432,7 +465,7 @@ public class RTPCharging {
 									log("Vehicle charging failed to restart.");
 								}
 							}
-							
+
 							if (!isCharging) {
 								isCharging = startCharging(id);
 							} else {
@@ -452,15 +485,15 @@ public class RTPCharging {
 					}
 				}
 			}
-			
+
 			previousVehicleState = currentVehicleState;
-			
+
 			sleep(pollIntervalSeconds);
 
-			loadConfiguration();			
+			loadConfiguration();
 		}
 	}
-	
+
 	/**
 	 * Get the current number of seconds since January 1, 1970
 	 * @return Current number of seconds since January 1, 1970
@@ -468,7 +501,7 @@ public class RTPCharging {
 	private static int currentTime() {
 		return (int) Math.floor(Instant.now().toEpochMilli() / 1000);
 	}
-	
+
 	/**
 	 * Stop execution and exit when we encounter an error and cannot continue.
 	 * @param msg Error message to write
@@ -478,10 +511,10 @@ public class RTPCharging {
 		if (!msg.endsWith(".")) {
 			msg += ".";
 		}
-		
+
 		logger.fatal(msg + " Exiting.");
 		System.exit(0);
-	}	
+	}
 
 	/**
 	 * Get the most recnet 5-minute price from ComEd
@@ -490,16 +523,16 @@ public class RTPCharging {
 	private static JSONObject getLatestComEdPrice() {
 		RESTRequest pricesRequest = null;
 		JSONObject pricesResponse = null;
-		
+
 		try {
 			pricesRequest = new RESTRequest("https://hourlypricing.comed.com");
 			pricesResponse = pricesRequest.requestJSON("api?type=5minutefeed");
 		} catch (Exception ex) { }
-		
+
 		if (pricesResponse == null || !pricesResponse.has("d")) {
 			return null;
 		}
-		
+
 		// Sort the values to get the most recent value.
 		// It seems like this is always in position 0 anyway, but we shouldn't trust that.
 		JSONArray values = pricesResponse.getJSONArray("d");
@@ -510,11 +543,11 @@ public class RTPCharging {
 				sortedValues.add(value);
 			}
 		}
-		
+
 		if (sortedValues.size() == 0) {
 			return null;
-		}		
-		
+		}
+
 		Collections.sort(sortedValues, new Comparator<JSONObject>() {
 			@Override
 	        public int compare(JSONObject a, JSONObject b) {
@@ -524,79 +557,80 @@ public class RTPCharging {
 	            try {
 	                valA = Long.parseLong(a.getString("millisUTC"));
 	                valB = Long.parseLong(b.getString("millisUTC"));
-	            } 
+	            }
 	            catch (JSONException e) { }
 
 	            return valB.compareTo(valA);
-	        }					
+	        }
 		});
-		
+
 		return sortedValues.get(0);
 	}
-	
+
 	/**
 	 * Get the charge state of the vehicle
 	 * @param id ID of the vehicle to use when requesting charge state
 	 * @return Charge state response JSON object
 	 */
 	private static JSONObject getVehicleChargeState(String id) {
-		int tries = 0;
-		while(++tries < MAX_RETRIES) {	
-			JSONObject chargeStateResponse = null;
-			try {
-				chargeStateResponse = teslaAPI.requestJSON("api/1/vehicles/" + id + "/data_request/charge_state");
-			} catch (Exception ex) {
-				String errorMessage = ExceptionUtils.getExceptionString(ex);
-				if (errorMessage.indexOf("HTTP response code: 40") < 0) {			
-					logger.error("Failed to get charge state: {}", ExceptionUtils.getExceptionString(ex));
-				} else {
-					refreshTokens();
-				}
-			}
-			
-			if (chargeStateResponse != null && chargeStateResponse.has("response")) {
-				JSONObject data = chargeStateResponse.getJSONObject("response");
-				logger.debug("Vehicle charge state response: {}", data.toString(2));
-				return data;
-			}
-			
-			sleep(RETRY_INTERVAL_SECONDS);
+		JSONObject vehicleDataResponse = getVehicleData(id);
+		if (vehicleDataResponse != null && vehicleDataResponse.has("charge_state")) {
+			JSONObject data = vehicleDataResponse.getJSONObject("charge_state");
+			logger.debug("Charge state response: {}",  data.toString(2));
+			return data;
 		}
-		
 		return null;
 	}
 	
 	/**
-	 * Get the drive state of the vehicle
-	 * @param id ID of the vehicle to use when requesting drive state
-	 * @return Drive state response JSON object
-	 */
-	private static JSONObject getVehicleDriveState(String id) {
+	 * Get the full vehicle data set
+	 * @param id ID of the vehicle to use when requesting vehicle data
+	 * @return Vehicle data response JSON object
+	 */	
+	private static JSONObject getVehicleData(String id) {
 		int tries = 0;
-		while(++tries < MAX_RETRIES) {			
-			JSONObject driveStateResponse = null;
+		while(++tries < MAX_RETRIES) {
+			JSONObject vehicleDataResponse = null;
 			try {
-				driveStateResponse = teslaAPI.requestJSON("api/1/vehicles/" + id + "/data_request/drive_state");
+				vehicleDataResponse = teslaAPI.requestJSON("api/1/vehicles/" + id + "/vehicle_data");
 			} catch (Exception ex) {
+				logger.debug("Vehicle data exception: {}", ExceptionUtils.getExceptionString(ex));
 				String errorMessage = ExceptionUtils.getExceptionString(ex);
-				if (errorMessage.indexOf("HTTP response code: 40") < 0) {			
-					logger.error("Failed to get drive state: {}", ExceptionUtils.getExceptionString(ex));
+				if (errorMessage.indexOf("HTTP response code: 408") >= 0) {
+					wakeUpVehicle(id);
+				} else if (errorMessage.indexOf("HTTP response code: 40") < 0) {
+					logger.error("Failed to get vehicle data: {}", ExceptionUtils.getExceptionString(ex));
 				} else {
 					refreshTokens();
 				}
 			}
-			
-			if (driveStateResponse != null) {
-				JSONObject data = driveStateResponse.getJSONObject("response");
-				logger.debug("Vehicle drive state response: {}", data.toString(2));
+
+			if (vehicleDataResponse != null && vehicleDataResponse.has("response")) {
+				JSONObject data = vehicleDataResponse.getJSONObject("response");
+				logger.debug("Vehicle data response: {}", data.toString(2));
 				return data;
 			}
 			sleep(RETRY_INTERVAL_SECONDS);
 		}
 
 		return null;
+	}	
+
+	/**
+	 * Get the drive state of the vehicle
+	 * @param id ID of the vehicle to use when requesting drive state
+	 * @return Drive state response JSON object
+	 */
+	private static JSONObject getVehicleDriveState(String id) {
+		JSONObject vehicleDataResponse = getVehicleData(id);
+		if (vehicleDataResponse != null && vehicleDataResponse.has("drive_state")) {
+			JSONObject data = vehicleDataResponse.getJSONObject("drive_state");
+			logger.debug("Vehicle data response: {}",  data.toString(2));
+			return data;
+		}
+		return null;
 	}
-	
+
 	/**
 	 * Get a JSON object with the vehicle details matching the configured VIN.
 	 * If no VIN is configured and the account only has one Tesla associated with it, return that vehicle.
@@ -606,20 +640,20 @@ public class RTPCharging {
 		JSONObject vehicleMatch = null;
 
 		int tries = 0;
-		while(vehicleMatch == null && ++tries < MAX_RETRIES) {		
+		while(vehicleMatch == null && ++tries < MAX_RETRIES) {
 			try {
 				JSONObject responseJSON = teslaCommands.getJSON(apiBase + "/api/1/vehicles");
 				if (responseJSON != null && responseJSON.has("response")) {
 					JSONArray vehicles = responseJSON.getJSONArray("response");
 					if (vehicles != null && vehicles.length() > 0) {
-						
+
 						// When we only have one vehicle and no VIN, we use the identifier of the vehicle we've found.
 						if (vehicles.length() == 1 && (vin == null || vin.length() == 0)) {
 							JSONObject vehicle = vehicles.getJSONObject(0);
 							if (vehicle != null && vehicle.has("id_s")) {
 								vehicleMatch = vehicle;
 							}
-							
+
 						// With multiple vehicles or a defined VIN, make sure we find the correct vehicle.
 						} else {
 							for(int i = 0; i < vehicles.length(); i++) {
@@ -645,13 +679,13 @@ public class RTPCharging {
 					logger.warn("Error while attempting to retrieve vehicle identifier for API: {}", errorMessage);
 				}
 			}
-			
+
 			sleep(RETRY_INTERVAL_SECONDS);
 		}
-		
+
 		return vehicleMatch;
 	}
-	
+
 	/**
 	 * Get the current state of the vehicle with the provided ID.
 	 * NOTE! This call won't wake a sleeping Tesla!
@@ -661,7 +695,7 @@ public class RTPCharging {
 	private static String getVehicleState(String id) {
 		int tries = 0;
 		while(++tries < MAX_RETRIES) {
-			JSONObject vehicleResponse = null;			
+			JSONObject vehicleResponse = null;
 			try {
 				vehicleResponse = teslaAPI.requestJSON("api/1/vehicles/" + id);
 			} catch (Exception ex) {
@@ -670,23 +704,23 @@ public class RTPCharging {
 					refreshTokens();
 				} else {
 					logger.warn("Failed to get vehicle: {}", errorMessage);
-				}		
+				}
 			}
-			
+
 			if (vehicleResponse != null) {
 				JSONObject data = vehicleResponse.getJSONObject("response");
-				logger.debug("Vehicle state response: {}", data.toString(2));			
+				logger.debug("Vehicle state response: {}", data.toString(2));
 				if (data.has("state")) {
 					return data.getString("state");
 				}
 			}
-			
+
 			sleep(RETRY_INTERVAL_SECONDS);
 		}
 
 		return "unknown";
 	}
-	
+
 	/**
 	 * Determine whether vehicle is currently charging.
 	 * @param id ID of the vehicle to use when requesting the charge state
@@ -702,7 +736,7 @@ public class RTPCharging {
 				}
 			} catch (Exception ex) { }
 		}
-		
+
 		return false;
 	}
 
@@ -719,7 +753,7 @@ public class RTPCharging {
 		} else if (lastConfigurationModification > 0) {
 			return;
 		}
-		lastConfigurationModification = config.lastModified();		
+		lastConfigurationModification = config.lastModified();
 
 		Properties prop = new Properties();
 		try (FileInputStream fis = new FileInputStream(propertiesFile)) {
@@ -735,17 +769,17 @@ public class RTPCharging {
 		// you're dealing with a whole new car so you should restart anyway.
 		if (!configurationUpdated) {
 			try {
-				accessToken = prop.getProperty(ACCESS_TOKEN);		
+				accessToken = prop.getProperty(ACCESS_TOKEN);
 				refreshToken = prop.getProperty(REFRESH_TOKEN);
 			} catch (Exception ex) { }
-			
+
 			if (accessToken == null || accessToken.length() == 0 || refreshToken == null || refreshToken.length() == 0) {
 				exitWithError("Tesla API access token and/or refresh token missing.");
 			}
-			
-			vin = prop.getProperty(VIN);			
+
+			vin = prop.getProperty(VIN);
 		}
-		
+
 		// Home lat/long
 		try {
 			double newHomeLatitude = Double.parseDouble(prop.getProperty(HOME_LATITUDE));
@@ -758,7 +792,7 @@ public class RTPCharging {
 		} catch (Exception ex) {
 			exitWithError("Exception while setting Home latitude/longitude: " + ExceptionUtils.getExceptionString(ex));
 		}
-		
+
 		// Max electricity price
 		try {
 			double newMaxElectricityPrice = Double.parseDouble(prop.getProperty(MAX_ELECTRICITY_PRICE));
@@ -769,7 +803,7 @@ public class RTPCharging {
 		} catch (Exception ex) {
 			maxElectricityPrice = 6;
 		}
-		
+
 		// Polling interval
 		try {
 			int newPollIntervalSeconds = Integer.parseInt(prop.getProperty(POLL_INTERVAL_SECONDS));
@@ -780,7 +814,7 @@ public class RTPCharging {
 		} catch (Exception ex) {
 			pollIntervalSeconds = 30;
 		}
-		
+
 		// Departure charge settings
 		boolean departureChargeUpdated = false;
 		try {
@@ -793,12 +827,12 @@ public class RTPCharging {
 		} catch (Exception ex) {
 			minimumDepartureSoC = 0;
 		}
-		
+
 		try {
 			double newSoCGainPerHour = Double.parseDouble(prop.getProperty(SOC_GAIN_PER_HOUR));
 			if (configurationUpdated && newSoCGainPerHour != soCGainPerHour) {
 				log("New SoC gain per hour: " + newSoCGainPerHour + "%");
-				departureChargeUpdated = true;				
+				departureChargeUpdated = true;
 			}
 			soCGainPerHour = newSoCGainPerHour;
 		} catch (Exception ex) {
@@ -806,32 +840,32 @@ public class RTPCharging {
 			minimumDepartureSoC = 0;
 		}
 
-		shouldChargeForDepature = (minimumDepartureSoC > 0 && soCGainPerHour > 0);		
+		shouldChargeForDepature = (minimumDepartureSoC > 0 && soCGainPerHour > 0);
 		if (configurationUpdated && departureChargeUpdated) {
 			log("Vehicle will" + (!shouldChargeForDepature ? " not" : "") + " be charged to reach minimum departure SoC" + (minimumDepartureSoC > 0 ? " of " + minimumDepartureSoC + "%" : "") + ".");
 		}
-		
+
 		// Restart on current drop setting
 		boolean newRestartOnCurrentDrop = false;
 		String restartOnCurrentDropSetting = prop.getProperty(RESTART_ON_CURRENT_DROP);
 		if (restartOnCurrentDropSetting != null && restartOnCurrentDropSetting.toLowerCase().equals("y")) {
 			newRestartOnCurrentDrop = true;
 		}
-		
+
 		if (configurationUpdated && newRestartOnCurrentDrop != restartOnCurrentDrop) {
 			log("New restart on current drop flag: " + (newRestartOnCurrentDrop ? "Y" : "N"));
 		}
 		restartOnCurrentDrop = newRestartOnCurrentDrop;
-	}	
-	
+	}
+
 	/**
 	 * Log an informational message
 	 * @param msg String message to log
 	 */
 	private static void log(String msg) {
 		logger.info(msg);
-	}	
-	
+	}
+
 	/**
 	 * Refresh the access and refresh tokens for Tesla API access
 	 */
@@ -842,7 +876,7 @@ public class RTPCharging {
 			.put("refresh_token", refreshToken)
 			.put("scope", "openid email offline_access")
 		;
-		
+
 		WebRequest tokenRequest = new WebRequest();
 		try {
 			String response = tokenRequest.post("https://auth.tesla.com/oauth2/v3/token", body.toString());
@@ -853,7 +887,7 @@ public class RTPCharging {
 				newAccessToken = responseJSON.getString("access_token");
 				newRefreshToken = responseJSON.getString("refresh_token");
 			}
-			
+
 			if (newAccessToken != null) {
 				HashMap<String, Object> newTokens = new HashMap<String, Object>();
 				newTokens.put(ACCESS_TOKEN, newAccessToken);
@@ -861,7 +895,7 @@ public class RTPCharging {
 
 				accessToken = newAccessToken;
 				refreshToken = newRefreshToken;
-				
+
 				updateConfiguration(newTokens);
 			} else {
 				logger.error("Exception while handling new access token for Tesla Owner API: Null new access token");
@@ -869,10 +903,10 @@ public class RTPCharging {
 		} catch (Exception ex) {
 			logger.error("Exception while getting refresh token for Tesla API: {}", ExceptionUtils.getExceptionString(ex));
 		}
-		
+
 		setupAPIObjects();
-	}	
-	
+	}
+
 	/**
 	 * Send a charge command to the vehicle
 	 * @param id ID of the vehicle to use in the charge command request
@@ -886,36 +920,36 @@ public class RTPCharging {
 			try {
 				String chargeResponse = teslaCommands.post(apiEndpoint);
 				JSONObject responseJSON = new JSONObject(chargeResponse);
-				if (responseJSON != null && responseJSON.has("response") && responseJSON.getJSONObject("response").has("result") && 
+				if (responseJSON != null && responseJSON.has("response") && responseJSON.getJSONObject("response").has("result") &&
 					responseJSON.getJSONObject("response").getBoolean("result") == true) {
 					return true;
 				}
 			} catch (Exception ex) {
 				String errorMessage = ExceptionUtils.getExceptionString(ex);
-				if (errorMessage.indexOf("HTTP response code: 40") < 0) {				
+				if (errorMessage.indexOf("HTTP response code: 40") < 0) {
 					logger.error("Exception while calling charging request to {}: {}", apiEndpoint, ExceptionUtils.getExceptionString(ex));
 				} else {
 					refreshTokens();
 				}
 			}
-			
+
 			sleep(RETRY_INTERVAL_SECONDS);
 		}
-		
+
 		return false;
 	}
-	
+
 	/**
 	 * Create the objects we use to access the Tesla API.
 	 */
 	private static void setupAPIObjects() {
 		teslaAPI = new RESTRequest().setBaseUrl(apiBase);
 		teslaAPI.setBearer(accessToken);
-		
+
 		teslaCommands = new WebRequest();
 		teslaCommands.setBearer(accessToken);
-	}	
-	
+	}
+
 	/**
 	 * Pause execution for a provided number of seconds.
 	 * @param seconds Number of seconds to pause execution
@@ -924,8 +958,8 @@ public class RTPCharging {
 		try {
 			Thread.sleep(seconds * 1000);
 		} catch (Exception e) { }
-	}	
-	
+	}
+
 	/**
 	 * Start charging the vehicle
 	 * @param id ID of the vehicle to use in the request to start charging
@@ -936,7 +970,7 @@ public class RTPCharging {
 		log("Vehicle charge start " + (result ? "successful" : "failed") + ".");
 		return result;
 	}
-	
+
 	/**
 	 * Stop charging the vehicle
 	 * @param id ID of the vehicle to use in the request to stop charging
@@ -947,14 +981,15 @@ public class RTPCharging {
 		log("Vehicle charge stop " + (result ? "successful" : "failed") + ".");
 		return !result;
 	}
-	
+
 	/**
 	 * Store any updated configuration values in the properties file
 	 * @param configChanges HashMap of configuration keys and values to update
 	 */
 	private static void updateConfiguration(HashMap<String, Object> configChanges) {
+		logger.debug("Update configuration with {}", new JSONObject(configChanges).toString());		
 		ArrayList<String> newLines = new ArrayList<String>();
-		Scanner scanner;		
+		Scanner scanner;
 		try {
 			scanner = new Scanner(new File(propertiesFile));
 			while(scanner.hasNextLine()) {
@@ -974,7 +1009,7 @@ public class RTPCharging {
 		} catch (Exception ex) {
 			logger.error("Configuration read/update exception: {}", ExceptionUtils.getExceptionString(ex));
 		}
-		
+
 		if (newLines.size() > 0) {
 			BufferedWriter writer;
 			try {
@@ -983,16 +1018,16 @@ public class RTPCharging {
 					writer.write(line + "\n");
 				}
 				writer.close();
-				
+
 				sleep(1);
 				File config = new File(propertiesFile);
-				lastConfigurationModification = config.lastModified();				
+				lastConfigurationModification = config.lastModified();
 			} catch (Exception ex) {
 				logger.error("Configuration write exception: {}", ExceptionUtils.getExceptionString(ex));
 			}
 		}
 	}
-	
+
 	/**
 	 * Request current location details from vehicle and store them in our queue, returning the current location details.
 	 * @param id ID of the vehicle to use in the drive state request
@@ -1000,26 +1035,26 @@ public class RTPCharging {
 	 */
 	private static VehicleLocation updateVehicleLocationDetails(String id) {
 		wakeUpVehicle(id);
-		
+
 		JSONObject driveStateResponse = getVehicleDriveState(id);
 		VehicleLocation v = null;
 		if (driveStateResponse != null) {
 			try {
 				if (driveStateResponse.has("latitude") && driveStateResponse.has("longitude")) {
-				
+
 					double currentLatitude = driveStateResponse.getDouble("latitude");
 					double currentLongitude = driveStateResponse.getDouble("longitude");
-					double speed = driveStateResponse.getDouble("speed");
+					double speed = driveStateResponse.isNull("speed") ? 0 : driveStateResponse.getDouble("speed");
 					double heading = driveStateResponse.getDouble("heading");
 					double timestamp = driveStateResponse.getDouble("timestamp");
-					
+
 					v = new VehicleLocation(currentLatitude, currentLongitude, speed, heading, timestamp);
-					
+
 					// Vehicle is currently navigating. We can use that to schedule the next location poll!
 					if (driveStateResponse.has("active_route_latitude") && driveStateResponse.has("active_route_longitude")) {
 						double destinationLatitude = driveStateResponse.getDouble("active_route_latitude");
 						double destinationLongitude = driveStateResponse.getDouble("active_route_longitude");
-						
+
 						VehicleLocation destination = new VehicleLocation(destinationLatitude, destinationLongitude);
 						if (driveStateResponse.has("active_route_minutes_to_arrival")) {
 							double destinationMinutesToArrival = driveStateResponse.getDouble("active_route_minutes_to_arrival");
@@ -1028,21 +1063,21 @@ public class RTPCharging {
 							} else {
 								v.setGoingAwayFromHome(true);
 							}
-							v.setMinutesToArrival(destinationMinutesToArrival);							
+							v.setMinutesToArrival(destinationMinutesToArrival);
 						}
 					}
-					
+
 					logger.debug("Most recent vehicle location: {}", v.toString());
-					
-					// When we see vehicle is at home, clear location history so when we start looking at history to 
+
+					// When we see vehicle is at home, clear location history so when we start looking at history to
 					// determine next polling times we don't have to worry about home -> destination -> home.
-					double distanceFromHome = v.distanceFrom(homeLatitude, homeLongitude);					
+					double distanceFromHome = v.distanceFrom(homeLatitude, homeLongitude);
 					if (distanceFromHome == 0) {
 						vehicleLocationHistory.clear();
 						lastHome = v;
 					}
 
-					// Only add this new location to the queue if it significantly different from the two entries that came 
+					// Only add this new location to the queue if it significantly different from the two entries that came
 					// before it. We only need two entries in a row to decide the vehicle has stopped, no point in continuing
 					// to fill the queue with stopped entries.
 					int locationHistorySize = vehicleLocationHistory.size();
@@ -1060,9 +1095,9 @@ public class RTPCharging {
 				logger.error("Failed to parse drive state response: {}", ExceptionUtils.getExceptionString(ex));
 			}
 		}
-		
+
 		return v;
-	}	
+	}
 
 	/**
 	 * Wake up the vehicle so we know future commands will work.
@@ -1088,13 +1123,13 @@ public class RTPCharging {
 				} else {
 					refreshTokens();
 				}
-			} catch (Exception ex) { 
+			} catch (Exception ex) {
 				refreshTokens();
 			}
-			
+
 			if (!isAwake) {
 				sleep(RETRY_INTERVAL_SECONDS);
 			}
 		}
-	}	
+	}
 }
