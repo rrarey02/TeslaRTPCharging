@@ -393,7 +393,8 @@ public class RTPCharging {
 
 						int timestamp = (int) Math.floor(chargeStateResponse.getDouble("timestamp") / 1000);
 						int departureTime = chargeStateResponse.getInt("scheduled_departure_time");
-						if (departureTime > timestamp) {
+						boolean preconditionBattery = chargeStateResponse.getBoolean("preconditioning_enabled");
+						if (preconditionBattery && departureTime > timestamp) {
 							minutesToDeparture = (int) Math.floor((departureTime - timestamp) / 60);
 						}
 
