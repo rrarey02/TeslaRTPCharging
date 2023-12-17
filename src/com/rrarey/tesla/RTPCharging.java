@@ -31,7 +31,7 @@ import com.rrarey.web.RESTRequest;
 import com.rrarey.web.WebRequest;
 
 public class RTPCharging {
-	static final String programVersion = "1.0.3";
+	static final String programVersion = "1.0.6";
 	
 	// Tesla API base URL
 	static final String apiBase = "https://owner-api.teslamotors.com";
@@ -134,7 +134,7 @@ public class RTPCharging {
 		// Next time we are going to check on the car's location. Seconds since January 1, 1970.
 		long nextLocationCheckSeconds = 0;
 
-		log("Starting ComEd Real-Time price monitoring version " + programVersion + " for Tesla VIN " + vehicleMatch.getString("vin") + " (" + ((displayName != null && displayName.length() > 0) ? displayName : id) + ").");
+		log("Starting RTP monitoring v" + programVersion + " for Tesla VIN " + vehicleMatch.getString("vin") + " (" + ((displayName != null && displayName.length() > 0) ? displayName : id) + ").");
 		log("Polling for new price data every " + pollIntervalSeconds + " seconds.");
 		log("Vehicle will" + (!shouldChargeForDepature ? " not" : "") + " be charged to reach minimum departure SoC" + (minimumDepartureSoC > 0 ? " of " + minimumDepartureSoC + "%" : "") + ".");
 		log("Vehicle is" + (!isCharging ? " not" : "") + " currently charging.");
@@ -287,14 +287,20 @@ public class RTPCharging {
 			}
 
 			// This shouldn't happen, but in case it does...
+			boolean assumedAtHome = false;
 			if (currentLocation == null) {
 				currentLocation = updateVehicleLocationDetails(id);
 				
 				if (currentLocation == null) {
 					sleep(RETRY_INTERVAL_SECONDS);
-					continue;
+			        currentLocation = updateVehicleLocationDetails(id);
 				}
 			}
+			if (currentLocation == null) {
+				currentLocation = new VehicleLocation(homeLatitude, homeLongitude);
+				currentLocation.setTimestamp(System.currentTimeMillis());
+				assumedAtHome = true;
+			} 			
 
 			double locationTime = currentLocation.getTimestampMillis();
 			double distanceFromHome = currentLocation.distanceFrom(homeLatitude, homeLongitude);
@@ -311,7 +317,7 @@ public class RTPCharging {
 
 			if (comEdCurrentUTC != comEdLastUTC) {
 				Date date = new Date(comEdCurrentUTC);
-				log("ComEd 5-minute price (" + currentPrice + "\u00A2 / kWh) from " + df.format(date) + " is " + (currentPrice <= maxElectricityPrice ? "valid for charging (<= " + maxElectricityPrice : "not valid for charging (> " + maxElectricityPrice) + "\u00A2 / kWh)");
+				log("5-minute price (" + currentPrice + "\u00A2/kWh) from " + df.format(date) + " is " + (currentPrice <= maxElectricityPrice ? "valid for charging (<=" + maxElectricityPrice : "not valid for charging (>" + maxElectricityPrice) + "\u00A2/kWh)");
 				comEdLastUTC = comEdCurrentUTC;
 				newData = true;
 			}
@@ -589,11 +595,26 @@ public class RTPCharging {
 	 * @return Vehicle data response JSON object
 	 */	
 	private static JSONObject getVehicleData(String id) {
+		return getVehicleData(id, null);
+	}
+	
+	/**
+	 * Get the full vehicle data set
+	 * @param id ID of the vehicle to use when requesting vehicle data
+	 * @return Vehicle data response JSON object
+	 */	
+	private static JSONObject getVehicleData(String id, String query) {
+		if (query != null && !query.startsWith("?")) {
+			query = "?" + query; 
+		}
+	    if (query == null || query.length() <= 1) {
+	    	query = "";
+	    }
 		int tries = 0;
 		while(++tries < MAX_RETRIES) {
 			JSONObject vehicleDataResponse = null;
 			try {
-				vehicleDataResponse = teslaAPI.requestJSON("api/1/vehicles/" + id + "/vehicle_data");
+				vehicleDataResponse = teslaAPI.requestJSON("api/1/vehicles/" + id + "/vehicle_data" + query);
 			} catch (Exception ex) {
 				logger.debug("Vehicle data exception: {}", ExceptionUtils.getExceptionString(ex));
 				String errorMessage = ExceptionUtils.getExceptionString(ex);
@@ -608,7 +629,7 @@ public class RTPCharging {
 
 			if (vehicleDataResponse != null && vehicleDataResponse.has("response")) {
 				JSONObject data = vehicleDataResponse.getJSONObject("response");
-				logger.debug("Vehicle data response: {}", data.toString(2));
+				logger.debug("Vehicle data" + (!query.isEmpty() ? (" (" + query + ")") : "") + " response: {}", data.toString(2));
 				return data;
 			}
 			sleep(RETRY_INTERVAL_SECONDS);
@@ -623,7 +644,7 @@ public class RTPCharging {
 	 * @return Drive state response JSON object
 	 */
 	private static JSONObject getVehicleDriveState(String id) {
-		JSONObject vehicleDataResponse = getVehicleData(id);
+		JSONObject vehicleDataResponse = getVehicleData(id, "?endpoints=location_data");
 		if (vehicleDataResponse != null && vehicleDataResponse.has("drive_state")) {
 			JSONObject data = vehicleDataResponse.getJSONObject("drive_state");
 			logger.debug("Vehicle data response: {}",  data.toString(2));
